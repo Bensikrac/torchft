@@ -50,6 +50,8 @@ from torchft.process_group import ProcessGroup, ReconfigureOptions
 from torchft.utils import get_stream_context, synchronize
 from torchft.work import _DummyWork
 
+from CompressLoCo.optimizer import compressloco
+
 IS_TRITON_AVAILABLE = True
 try:
     import triton
@@ -338,6 +340,8 @@ class Manager:
             manager=self, replica_id=replica_id or "", group_rank=group_rank
         )
 
+        self.enable_compressloco = str(os.getenv("ENABLE_COMPRESSLOCO")) == "1"
+
         self._step = 0
         self._quorum_id = -1
         self._errored: Optional[ExceptionWithTraceback] = None
@@ -418,6 +422,8 @@ class Manager:
         should_quantize: bool = False,
         # pyrefly: ignore [bad-function-definition]
         reduce_op: ReduceOp = ReduceOp.AVG,
+        fragment_index: int = 0,
+        grad_name: str = "",
     ) -> Work:
         """
         Fault tolerant allreduce the tensor and return a Future that will be completed when
@@ -470,7 +476,13 @@ class Manager:
             else:
                 opts = AllreduceOptions()
                 opts.reduceOp = pg_reduce_op
-                work = self._pg.allreduce([tensor], opts)
+                if self.enable_compressloco:
+                    opts.reduceOp = ReduceOp.AVG
+                    work = compressloco.allreduce_hook(
+                        tensor, opts, fragment_index, grad_name
+                    )
+                else:
+                    work = self._pg.allreduce([tensor], opts)
 
             # schedule grad normalization as a continuation
             # on the Future
@@ -486,7 +498,8 @@ class Manager:
             managed_work = _ManagedWork(self, work, tensor)
             fut = managed_work.get_future()
             fut = cast(torch.futures.Future[torch.Tensor], fut)
-            fut = fut.then(callback)
+            if not self.enable_compressloco:
+                fut = fut.then(callback)
             return managed_work
 
         except Exception as e:

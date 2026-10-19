@@ -23,6 +23,8 @@ from torch.utils.hooks import RemovableHandle
 from torchft.manager import Manager
 from torchft.utils import get_stream_context
 
+from CompressLoCo import local_sgd_hooks as hooks
+
 logger: logging.Logger = logging.getLogger(__name__)
 
 USE_BUCKETIZATION_ENV: str = "TORCHFT_USE_BUCKETIZATION"
@@ -192,6 +194,7 @@ class _StreamingDiLoCoFragment:
         should_quantize: bool = False,
         fragment_sync_delay: int = 0,
         fragment_update_alpha: float = 0.0,
+        parent=None,
     ) -> None:
         if fragment_sync_offset > sync_every:
             raise ValueError("Fragment must be synced once before `sync_every` steps")
@@ -207,6 +210,7 @@ class _StreamingDiLoCoFragment:
         self._pin_memory = pin_memory
         self._fragment_sync_delay = fragment_sync_delay
         self._fragment_update_alpha = fragment_update_alpha
+        self.parent = parent
 
         self._outer_optimizer = outer_optimizer
 
@@ -221,10 +225,17 @@ class _StreamingDiLoCoFragment:
         # Recorded on `_stream` to wait for allreduce to finish
         self._stop_event: Optional[torch.Event] = None
 
+        # compressloco: unlimited bucket cap so all pseudo-gradients are
+        # compressed in a single bucket per sync (upstream default otherwise)
+        self.bucket_cap_mb = hooks.default_bucket_cap_mb(self.bucket_cap_mb)
+
         if bucket_cap_mb is not None:
             self.bucket_cap_mb = int(bucket_cap_mb * 1024 * 1024)
 
-        if os.getenv(USE_BUCKETIZATION_ENV, "False") == "True":
+        if (
+            os.getenv(USE_BUCKETIZATION_ENV, "False") == "True"
+            or hooks.bucketization_feature_enabled()
+        ):
             self.use_bucketization = True
         else:
             self.use_bucketization = use_bucketization
@@ -338,10 +349,20 @@ class _StreamingDiLoCoFragment:
                 )
                 self._grads[name] = pseudogradient
 
+            # compressloco: bandwidth scheduler notification
+            hooks.on_grads_saved(self._grads)
+
     def _set_grads(self) -> None:
         """
         Sets the gradients of the model fragment from the allreduce result
         """
+        # compressloco: assigns decoupled p.grad clones and applies the error
+        # accumulator / advanced error handling corrections. Returns False when
+        # CompressLoCo is disabled, in which case the upstream assignment below
+        # runs.
+        if hooks.set_grads(self):
+            return
+
         with torch.no_grad():
             for name, p in self._model_fragment.named_parameters():
                 # avoid copying the gradient, it should be on the same device
@@ -365,6 +386,9 @@ class _StreamingDiLoCoFragment:
         """
         self._local_parameters = {}
 
+        # compressloco: notify to clear up and CPU offload
+        hooks.on_sync_end()
+
     def _merge_parameters(self) -> None:
         """
         Merges the local and global parameters.
@@ -384,6 +408,9 @@ class _StreamingDiLoCoFragment:
                 )
             else:
                 p.data.lerp_(self._local_parameters[name], self._fragment_update_alpha)
+
+            # compressloco: error accumulator / advanced error handling apply
+            hooks.post_merge_parameters(self, name, p)
 
     @torch.profiler.record_function("torchft::local_sgd::wait")
     def wait(self) -> None:
@@ -474,6 +501,8 @@ class _StreamingDiLoCoFragment:
         - Per-parameter allreduce (old behavior)
         - Bucketized allreduce (new behavior)
         """
+        # compressloco: notify to init buffers into VRAM
+        hooks.on_allreduce_start()
         if self.use_bucketization:
             self._allreduce_bucketized()
         else:
@@ -484,7 +513,11 @@ class _StreamingDiLoCoFragment:
         for name, p in self._model_fragment.named_parameters():
             # Perform allreduce on the pseudogradients
             work = self._manager.allreduce(
-                self._grads[name], should_quantize=self.should_quantize
+                self._grads[name],
+                should_quantize=self.should_quantize,
+                # compressloco: per-gradient compression hook
+                grad_name=name,
+                fragment_index=self.parent._current_fragment(),
             )
 
             self._allreduce_work.append(work)
@@ -529,7 +562,11 @@ class _StreamingDiLoCoFragment:
                 flat_index += 1
 
             work = self._manager.allreduce(
-                flat_buffer, should_quantize=self.should_quantize
+                flat_buffer,
+                should_quantize=self.should_quantize,
+                # compressloco: per-bucket compression hook
+                grad_name="full_bucket",
+                fragment_index=self.parent._current_fragment(),
             )
 
             def callback(
@@ -668,6 +705,7 @@ class DiLoCo:
                 should_quantize,
                 fragment_sync_delay,
                 fragment_update_alpha,
+                self,
             )
             for i, model_fragment in enumerate(model_fragments)
         ]
